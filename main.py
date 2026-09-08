@@ -11,7 +11,23 @@ logger = logging.getLogger(__name__)
 # Placeholder raw_message produced by some OneBot implementations (e.g.
 # SnowLuma) when the reply segment conversion fails - the message content
 # is actually empty and must be rebuilt from segments or get_msg.
-_PLACEHOLDER_RAW = {"[引用消息]", "[空消息]", ""}
+# NOTE: raw_message is a CQ-coded string, so literal "[", "]", ",", "&" in
+# text arrive escaped as "&#91;", "&#93;", "&#44;", "&amp;" (SnowLuma
+# helper/cq.ts cqEscape). Every placeholder comparison must unescape first,
+# otherwise SnowLuma's "[引用消息]" placeholder arrives as "&#91;引用消息&#93;"
+# and slips through the filter.
+_PLACEHOLDER_TOKENS = {"[引用消息]", "[空消息]", "[引用]", "[转发消息]"}
+_PLACEHOLDER_RAW = _PLACEHOLDER_TOKENS | {""}
+_CQ_ENTITIES = (("&#91;", "["), ("&#93;", "]"), ("&#44;", ","), ("&amp;", "&"))
+
+
+def cq_unescape(text: str) -> str:
+    """Decode OneBot CQ entities; "&amp;" must be last (see SnowLuma cq.ts)."""
+    if not text:
+        return text
+    for entity, char in _CQ_ENTITIES:
+        text = text.replace(entity, char)
+    return text
 # Segment types whose source (url/file) may be missing in stored history
 # and needs a get_msg refresh (SnowLuma refreshes image URLs on get_msg).
 _MEDIA_TYPES = {"image", "record", "video"}
@@ -189,7 +205,7 @@ class HistoryPlugin(BasePlugin):
     def _needs_refresh(self, msg: dict) -> bool:
         """True when the message needs a get_msg refresh: placeholder
         raw_message, or media segments without a usable source."""
-        raw = (msg.get("raw_message") or "").strip()
+        raw = cq_unescape((msg.get("raw_message") or "").strip())
         if raw in _PLACEHOLDER_RAW:
             return True
         for seg in msg.get("message") or []:
@@ -205,9 +221,10 @@ class HistoryPlugin(BasePlugin):
         carries no real content - SnowLuma stores reply-conversion failures
         as such (raw_message = "[引用消息]" with empty/placeholder segments).
         Filtering these keeps the LLM context clean."""
-        raw = (msg.get("raw_message") or "").strip()
+        raw = cq_unescape((msg.get("raw_message") or "").strip())
         segs = msg.get("message") or []
         # Placeholder raw_message (non-empty) marks a conversion failure.
+        # raw_message is CQ-escaped, hence the cq_unescape above.
         if raw and raw in _PLACEHOLDER_RAW:
             return True
         # Empty raw_message is normal for segment-based messages - only
@@ -218,9 +235,18 @@ class HistoryPlugin(BasePlugin):
         # stripping the trailing (msg_id:xxx), the message is not real.
         content = self._message_to_text(msg)
         content = re.sub(r"\s*\(msg_id:-?\d+\)\s*$", "", content).strip()
-        if not content:
+        if not content or content in _PLACEHOLDER_TOKENS:
             return True
-        if content in ("[空消息]", "[引用消息]", "[引用]", "[转发消息]"):
+        # Second channel: render from the segment array (already unescaped)
+        # so an escaped placeholder raw_message cannot hide a fake message.
+        seg_text = self._segments_to_text(segs).strip() if segs else ""
+        if seg_text and seg_text in _PLACEHOLDER_TOKENS:
+            return True
+        # SnowLuma's synthetic backfill event: user_id 0 + a single
+        # "[引用消息]" text segment (message-actions.ts buildBackfillEvent).
+        uid = str(msg.get("user_id")
+                  or (msg.get("sender") or {}).get("user_id") or "").strip()
+        if uid in ("", "0") and seg_text in _PLACEHOLDER_TOKENS:
             return True
         return False
 
@@ -228,7 +254,7 @@ class HistoryPlugin(BasePlugin):
         """Convert a message to formatted text. Uses raw_message only when it
         is real content; placeholder raw_message (e.g. SnowLuma's
         "[引用消息]") falls back to the segment array."""
-        raw = (msg.get("raw_message") or "").strip()
+        raw = cq_unescape((msg.get("raw_message") or "").strip())
         if raw and raw not in _PLACEHOLDER_RAW:
             content = raw
         else:
@@ -310,19 +336,22 @@ class HistoryPlugin(BasePlugin):
 
 
         # ---------- 5. 拉取数据：WS 通道优先，HTTP 兜底 ----------
+        # Over-fetch so placeholder rows (which sit at the newest end) cannot
+        # crowd real messages out of the returned window.
+        fetch_count = min(80, max(count, count * 3))
         messages = None
         client = self._get_client(event) if self.use_ws else None
         if client is not None:
-            messages = await self._fetch_ws(client, session_type, session_id, count)
+            messages = await self._fetch_ws(client, session_type, session_id, fetch_count)
         if messages is None:
-            messages = await self._fetch_http(session_type, session_id, count)
+            messages = await self._fetch_http(session_type, session_id, fetch_count)
         if not messages:
             return "No messages found."
 
 
         # ---------- 6. 强解析：对占位/缺媒体源的消息批量 get_msg 刷新 ----------
         if client is not None:
-            target = messages[-count:]
+            target = messages[-fetch_count:]
             refreshed = 0
             for i, m in enumerate(target):
                 if refreshed >= _MAX_REFRESH:
@@ -343,12 +372,18 @@ class HistoryPlugin(BasePlugin):
         # after get_msg refresh (SnowLuma stores reply-conversion failures
         # as empty messages with a "[引用消息]" raw_message placeholder).
         # Showing them would confuse the LLM with fake "empty quotes".
+        # NOTE: iterate `target` (the refreshed slice) - the old code
+        # formatted `messages[-count:]` again, so every get_msg refresh was
+        # silently discarded.
         formatted = []
         skipped = 0
-        for msg in messages[-count:]:
+        real = []
+        for msg in (target if client is not None else messages[-fetch_count:]):
             if self._is_placeholder(msg):
                 skipped += 1
                 continue
+            real.append(msg)
+        for msg in real[-count:]:
             sender = msg.get("sender", {}).get("nickname", "Unknown")
             content = self._message_to_text(msg)
             formatted.append(f"{sender}: {content}")
